@@ -1,0 +1,34 @@
+## --- Visual Studio User settings ---
+.vs/
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+
+## --- compiled files (Build Output) ---
+[Bb]in/
+[Oo]bj/
+
+## --- NuGet Packages ---
+packages/
+*.nupkg
+*.snupkg
+
+## --- Temporary files & Logs ---
+*.log
+*.tmp
+*.cache
+Thumbs.db 
+Desktop.ini
+.DS_Store
+
+## --- test results ---
+TestResults/
+*.trx
+
+## --- Visual Studio Code ---
+.vscode/
+
+## --- ReSharper  ---
+_ReSharper*/
+*.DotSettings.user

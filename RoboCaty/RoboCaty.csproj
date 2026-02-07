@@ -1,0 +1,37 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <Platforms>AnyCPU;x64;x86</Platforms>
+    <Title>RoboCaty TwinCAT ABB Robot Controller Bridge</Title>
+    <Description>A lightweight C# bridge for cyclic variable exchange between Beckhoff TwinCAT (ADS) and ABB RobotStudio Virtual Controllers. Designed for virtual commissioning.</Description>
+    <Copyright>Matthias Seehauser</Copyright>
+    <PackageProjectUrl>https://github.com/seehma/RoboCaty</PackageProjectUrl>
+    <AssemblyVersion>1.0.0</AssemblyVersion>
+    <NeutralLanguage>en-GB</NeutralLanguage>
+    <FileVersion>1.0.0</FileVersion>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="ABBControllers" Version="1.0.0" />
+    <PackageReference Include="Beckhoff.TwinCAT.Ads" Version="7.0.152" />
+    <PackageReference Include="System.Configuration.ConfigurationManager" Version="10.0.2" />
+    <PackageReference Include="System.Diagnostics.PerformanceCounter" Version="10.0.2" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="ABB.Robotics.Controllers.PC">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\ABB\SDK\PCSDK 2025\ABB.Robotics.Controllers.PC.dll</HintPath>
+    </Reference>
+    <Reference Include="ABB.Robotics.RobotStudio">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.dll</HintPath>
+    </Reference>
+    <Reference Include="ABB.Robotics.RobotStudio.Controllers">
+      <HintPath>..\..\..\..\..\..\Program Files (x86)\ABB\RobotStudio 2025\Bin\ABB.Robotics.RobotStudio.Controllers.dll</HintPath>
+    </Reference>
+  </ItemGroup>
+
+</Project>

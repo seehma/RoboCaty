@@ -1,0 +1,6 @@
+r#MAIN.boStop:eci104_Stop[1]
+r#MAIN.boExecuteFromPlc:eci103_ExecuteToggleFromPlc[1]
+r#MAIN.NextMovePosition:eci117_NextMovementPosition[8]
+w#MAIN.boApplicationRunning:eco002_ApplicationRunning[1]
+w#MAIN.boExecuteToPlc:eco005_ExecuteToggleToPlc[1]
+w#MAIN.LastMovePosition:eco019_LastMovementPosition[8]
