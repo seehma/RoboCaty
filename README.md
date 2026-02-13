@@ -76,6 +76,15 @@ RoboCaty.exe -netid 5.12.80.1.1.1 -file "config.txt" -time 100 -verbose
 
 ---
 
+## FAQ
+Below are some issues encountered during testing, along with possible solutions.
+
+**Q: RoboCaty does not appear to connect to the ABB virtual controller. When I press `V`, I see errors regarding opening handles.**
+A: This can happen if handles are not cleaned up correctly, especially if RoboCaty was closed via the command line window's "X" button. In this case, simply restart the virtual controller on the ABB side. This should free up all handles and allow you to reconnect.
+
+**Q: It seems that not all variables are exchanged in the same cycle.**
+A: This is due to the asynchronous nature of RoboCaty. You must account for this behavior in your logic, on both the TwinCAT and the ABB RAPID program sides.
+
 ## Contributing
 
 If you encounter any issues or want to contribute to this project, feel free to open an **Issue** or submit a **Pull Request** on this repository.

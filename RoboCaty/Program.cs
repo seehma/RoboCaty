@@ -1,7 +1,10 @@
-﻿using System.Text.RegularExpressions;
-using ABB.Robotics.Controllers;
+﻿using ABB.Robotics.Controllers;
 using ABB.Robotics.Controllers.Discovery;
 using ABB.Robotics.Controllers.IOSystemDomain;
+using Microsoft.VisualBasic;
+using System.Reflection.Metadata;
+using System.Runtime.InteropServices;
+using System.Text.RegularExpressions;
 using TwinCAT;
 using TwinCAT.Ads;
 using TwinCAT.Ads.TypeSystem;
@@ -11,122 +14,183 @@ namespace AdsRobotInterface
 {
     class Program
     {
+        [DllImport("Kernel32")]
+        private static extern bool SetConsoleCtrlHandler(EventHandler handler, bool add);
+        private delegate bool EventHandler(CtrlType sig);
+        static EventHandler _handler;
+        enum CtrlType
+        {
+            CTRL_C_EVENT = 0,
+            CTRL_BREAK_EVENT = 1,
+            CTRL_CLOSE_EVENT = 2,
+            CTRL_LOGOFF_EVENT = 5,
+            CTRL_SHUTDOWN_EVENT = 6
+        }
+
         static string textFilePath = @"C:\temp\vars_robot.txt";
         static string amsNetId = "199.4.42.250.1.1";
         static int amsPort = 851;
-        static int cycleTimeMs = 500;
+        static int cycleTimeMs = 50;
         static bool showDashboard = false;
+
+        static Controller? robotController = null;
+        static bool keepRunning = true;
+        static bool isProcessing = false;
 
         static void Main(string[] args)
         {
             if (!ParseArguments(args)) return;
 
+            _handler += new EventHandler(Handler);
+            SetConsoleCtrlHandler(_handler, true);
+
             ShowConfiguration();
             Console.WriteLine("\n--- RoboCaty: TwinCAT <-> ABB Interface ---");
 
-            if (!File.Exists(textFilePath))
+            Console.CancelKeyPress += (sender, e) =>
             {
-                ExitWithError($"ERROR: Configuration file not found:\n'{Path.GetFullPath(textFilePath)}'");
-                return;
-            }
+                e.Cancel = true; 
+                keepRunning = false;
+                Console.WriteLine("\n[Shutdown] Stop request received...");
+            };
 
-            Console.WriteLine("Reading configuration...");
-            List<SignalMapping> mappings = LoadMappings(textFilePath);
-
-            if (mappings.Count == 0)
+            try
             {
-                ExitWithError("ERROR: No valid entries found in the configuration file.");
-                return;
-            }
-            Console.WriteLine($"[OK] {mappings.Count} variables loaded.");
-
-            Console.WriteLine("Scanning for virtual ABB controller...");
-            Controller robotController = ConnectToVirtualController();
-            if (robotController == null)
-            {
-                ExitWithError("ERROR: No virtual robot controller found!\nPlease ensure RobotStudio is running.");
-                return;
-            }
-            Console.WriteLine($"[OK] Robot controller connected: {robotController.SystemName}");
-
-            using (AdsClient client = new AdsClient())
-            {
-                try
+                if (!File.Exists(textFilePath))
                 {
-                    Console.WriteLine($"Connecting to TwinCAT {amsNetId}:{amsPort}...");
-                    client.Connect(amsNetId, amsPort);
+                    ExitWithError($"ERROR: Configuration file not found:\n'{Path.GetFullPath(textFilePath)}'");
+                    return;
+                }
 
-                    if (!client.IsConnected)
+                Console.WriteLine("Reading configuration...");
+                List<SignalMapping> mappings = LoadMappings(textFilePath);
+
+                if (mappings.Count == 0)
+                {
+                    ExitWithError("ERROR: No valid entries found in the configuration file.");
+                    return;
+                }
+                Console.WriteLine($"[OK] {mappings.Count} variables loaded.");
+
+                Console.WriteLine("Scanning for virtual ABB controller...");
+                robotController = ConnectToVirtualController();
+                if (robotController == null)
+                {
+                    ExitWithError("ERROR: No virtual robot controller found!\nPlease ensure RobotStudio is running.");
+                    return;
+                }
+                Console.WriteLine($"[OK] Robot controller connected: {robotController.SystemName}");
+
+                using (AdsClient client = new AdsClient())
+                {
+                    try
                     {
-                        ExitWithError($"ERROR: Could not connect to TwinCAT.");
-                        return;
-                    }
+                        Console.WriteLine($"Connecting to TwinCAT {amsNetId}:{amsPort}...");
+                        client.Connect(amsNetId, amsPort);
 
-                    ISymbolLoader loader = SymbolLoaderFactory.Create(client, SymbolLoaderSettings.Default);
-                    Console.WriteLine("[OK] TwinCAT connected.");
-
-                    Console.WriteLine("\n================================================");
-                    Console.WriteLine(" Program running in background.");
-                    Console.WriteLine(" [V]   -> Toggle Live Dashboard (On/Off)");
-                    Console.WriteLine(" [Q]   -> Quit Program");
-                    Console.WriteLine("================================================");
-
-                    bool running = true;
-                    List<string> currentLogBuffer = new List<string>();
-
-                    while (running)
-                    {
-                        currentLogBuffer.Clear();
-
-                        ProcessMappings(mappings, loader, robotController, currentLogBuffer);
-
-                        if (showDashboard)
+                        if (!client.IsConnected)
                         {
-                            Console.Clear();
-                            Console.WriteLine($"--- RoboCaty MONITORING ACTIVE ({DateTime.Now:HH:mm:ss}) ---");
-                            Console.WriteLine($"Cycle time: {cycleTimeMs}ms | Mappings: {mappings.Count}\n");
-                            Console.WriteLine($"{"DIRECTION",-10} | {"ADS VARIABLE",-30} | {"VALUE",-10} | {"ROBOT SIGNAL",-30}");
-                            Console.WriteLine(new string('-', 90));
-
-                            foreach (string logLine in currentLogBuffer)
-                            {
-                                Console.WriteLine(logLine);
-                            }
+                            ExitWithError($"ERROR: Could not connect to TwinCAT.");
+                            return;
                         }
 
-                        Thread.Sleep(cycleTimeMs);
+                        ISymbolLoader loader = SymbolLoaderFactory.Create(client, SymbolLoaderSettings.Default);
+                        Console.WriteLine("[OK] TwinCAT connected.");
 
-                        if (Console.KeyAvailable)
+                        Console.WriteLine("\n================================================");
+                        Console.WriteLine(" Program running in background.");
+                        Console.WriteLine(" [V]   -> Toggle Live Dashboard (On/Off)");
+                        Console.WriteLine(" [Q]   -> Quit Program");
+                        Console.WriteLine("================================================");
+
+                        List<string> currentLogBuffer = new List<string>();
+
+                        while (keepRunning)
                         {
-                            var keyInfo = Console.ReadKey(true);
-                            if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
+                            isProcessing = true;
+
+                            try
                             {
-                                running = false;
-                                Console.WriteLine("\nStopping program...");
-                            }
-                            else if (keyInfo.Key == ConsoleKey.V)
-                            {
-                                showDashboard = !showDashboard;
-                                if (!showDashboard)
+                                currentLogBuffer.Clear();
+
+                                ProcessMappings(mappings, loader, robotController, currentLogBuffer);
+
+                                if (showDashboard)
                                 {
                                     Console.Clear();
-                                    Console.WriteLine("Live dashboard deactivated.");
-                                    Console.WriteLine("Press [V] to enable, [Q] to quit.");
+                                    Console.WriteLine($"--- RoboCaty MONITORING ACTIVE ({DateTime.Now:HH:mm:ss}) ---");
+                                    Console.WriteLine($"Cycle time: {cycleTimeMs}ms | Mappings: {mappings.Count}\n");
+                                    Console.WriteLine($"{"DIRECTION",-10} | {"ADS VARIABLE",-30} | {"VALUE",-10} | {"ROBOT SIGNAL",-30}");
+                                    Console.WriteLine(new string('-', 90));
+
+                                    foreach (string logLine in currentLogBuffer)
+                                    {
+                                        Console.WriteLine(logLine);
+                                    }
+                                }
+
+                                int slept = 0;
+                                while (slept < cycleTimeMs && keepRunning)
+                                {
+                                    Thread.Sleep(100);
+                                    slept += 100;
+                                }
+
+                                if (Console.KeyAvailable)
+                                {
+                                    var keyInfo = Console.ReadKey(true);
+                                    if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
+                                    {
+                                        keepRunning = false;
+                                        Console.WriteLine("\nStopping program...");
+                                    }
+                                    else if (keyInfo.Key == ConsoleKey.V)
+                                    {
+                                        showDashboard = !showDashboard;
+                                        if (!showDashboard)
+                                        {
+                                            Console.Clear();
+                                            Console.WriteLine("Live dashboard deactivated.");
+                                            Console.WriteLine("Press [V] to enable, [Q] to quit.");
+                                        }
+                                    }
                                 }
                             }
+                            catch (Exception ex)
+                            {
+                                Console.WriteLine("[ERR] Processing data exchange loop");
+                            }
+                            finally
+                            {
+                                isProcessing = false;
+                            }
                         }
+
+                        isProcessing = false;
+                    }
+                    catch (Exception ex)
+                    {
+                        ExitWithError($"CRITICAL ERROR: {ex.Message}");
                     }
                 }
-                catch (Exception ex)
+
+                if (robotController != null)
                 {
-                    ExitWithError($"CRITICAL ERROR: {ex.Message}");
+                    CleanupResources();
                 }
             }
-
-            if (robotController != null)
+            catch (Exception ex)
             {
-                robotController.Logoff();
-                robotController.Dispose();
+                Console.ForegroundColor = ConsoleColor.Red;
+                Console.WriteLine($"\nCRITICAL ERROR: {ex.Message}");
+                Console.ResetColor();
+            }
+            finally
+            {
+                isProcessing = false;
+                CleanupResources();
+                Console.WriteLine("Done. Bye!");
+                Thread.Sleep(1000);
             }
         }
 
@@ -363,6 +427,62 @@ namespace AdsRobotInterface
                 }
             }
             return null;
+        }
+
+        private static void CleanupResources()
+        {
+            if (robotController != null)
+            {
+                Console.WriteLine("\nCleaning up resources...");
+
+                Console.WriteLine("- Logging off Robot...");
+                try
+                {
+                    robotController.Logoff();
+                }
+                catch {}
+
+                Console.WriteLine("- Disposing Robot Controller...");
+                try
+                {
+                    robotController.Dispose();
+                }
+                catch {}
+
+                robotController = null;
+            }
+        }
+
+        private static bool Handler(CtrlType sig)
+        {
+            switch (sig)
+            {
+                case CtrlType.CTRL_C_EVENT:
+                case CtrlType.CTRL_LOGOFF_EVENT:
+                case CtrlType.CTRL_SHUTDOWN_EVENT:
+                case CtrlType.CTRL_CLOSE_EVENT: // catch click on x (close)
+
+                    Console.WriteLine("\n[Shutdown] End program and cleanup resources...");
+                    keepRunning = false;
+
+                    Console.Write("Wait until data exchange cycle ends...");
+                    int maxWait = 40; // 40 * 100ms =4 Seconds
+                    while (isProcessing && maxWait > 0)
+                    {
+                        Thread.Sleep(100);
+                        maxWait--;
+                        Console.Write(".");
+                    }
+                    Console.WriteLine(" waiting Done.");
+
+                    CleanupResources();
+                    Console.WriteLine("Program done. Bye!");
+
+                    Thread.Sleep(2000);
+                    return true;
+                default:
+                    return false;
+            }
         }
     }
 
