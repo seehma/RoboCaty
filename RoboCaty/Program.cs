@@ -1,11 +1,15 @@
-﻿using ABB.Robotics.Controllers;
+﻿// ABB Robotics PC SDK
+using ABB.Robotics.Controllers;
 using ABB.Robotics.Controllers.Discovery;
 using ABB.Robotics.Controllers.IOSystemDomain;
-using Microsoft.VisualBasic;
-using System.Reflection.Metadata;
-using System.Runtime.InteropServices;
+using System;
+using System.Collections.Generic;
+using System.Globalization;
+using System.IO;
 using System.Text.RegularExpressions;
+using System.Threading;
 using TwinCAT;
+// TwinCAT
 using TwinCAT.Ads;
 using TwinCAT.Ads.TypeSystem;
 using TwinCAT.TypeSystem;
@@ -14,346 +18,361 @@ namespace AdsRobotInterface
 {
     class Program
     {
-        [DllImport("Kernel32")]
-        private static extern bool SetConsoleCtrlHandler(EventHandler handler, bool add);
-        private delegate bool EventHandler(CtrlType sig);
-        static EventHandler _handler;
-        enum CtrlType
-        {
-            CTRL_C_EVENT = 0,
-            CTRL_BREAK_EVENT = 1,
-            CTRL_CLOSE_EVENT = 2,
-            CTRL_LOGOFF_EVENT = 5,
-            CTRL_SHUTDOWN_EVENT = 6
-        }
-
+        // --- Configuration Defaults ---
         static string textFilePath = @"C:\temp\vars_robot.txt";
         static string amsNetId = "199.4.42.250.1.1";
         static int amsPort = 851;
-        static int cycleTimeMs = 50;
-        static bool showDashboard = false;
+        static int cycleTimeMs = 100;
+        static volatile bool showDashboard = false;
 
-        static Controller? robotController = null;
-        static bool keepRunning = true;
-        static bool isProcessing = false;
+        // --- Threading & Sync Globals ---
+        private static bool _quitRequested = false;
+        private static object _syncLock = new object();
+        private static AutoResetEvent _waitHandle = new AutoResetEvent(false);
+
+        // --- Robot Controller reference
+        private static Controller? robotController = null;
 
         static void Main(string[] args)
         {
             if (!ParseArguments(args)) return;
 
-            _handler += new EventHandler(Handler);
-            SetConsoleCtrlHandler(_handler, true);
+            // Setup & ProcessExit
+            AppDomain.CurrentDomain.ProcessExit += new EventHandler(CurrentDomain_ProcessExit);
 
-            ShowConfiguration();
-            Console.WriteLine("\n--- RoboCaty: TwinCAT <-> ABB Interface ---");
-
-            Console.CancelKeyPress += (sender, e) =>
+            if (!File.Exists(textFilePath))
             {
-                e.Cancel = true; 
-                keepRunning = false;
-                Console.WriteLine("\n[Shutdown] Stop request received...");
-            };
+                ExitWithError($"ERROR: Configuration file not found:\n'{Path.GetFullPath(textFilePath)}'");
+                return;
+            }
 
-            try
+            // Load Mappings
+            Console.WriteLine("Reading configuration file...");
+            List<SignalMapping> mappings = LoadMappings(textFilePath);
+            if (mappings.Count == 0)
             {
-                if (!File.Exists(textFilePath))
-                {
-                    ExitWithError($"ERROR: Configuration file not found:\n'{Path.GetFullPath(textFilePath)}'");
-                    return;
-                }
+                ExitWithError("ERROR: No valid mapping entries found.");
+                return;
+            }
 
-                Console.WriteLine("Reading configuration...");
-                List<SignalMapping> mappings = LoadMappings(textFilePath);
+            // Connect Robot
+            Console.WriteLine("Scanning for virtual ABB Controller...");
+            robotController = ConnectToVirtualController();
+            if (robotController == null)
+            {
+                ExitWithError("ERROR: No virtual robot controller found!");
+                return;
+            }
 
-                if (mappings.Count == 0)
-                {
-                    ExitWithError("ERROR: No valid entries found in the configuration file.");
-                    return;
-                }
-                Console.WriteLine($"[OK] {mappings.Count} variables loaded.");
+            PrintStatusScreen(mappings.Count);
 
-                Console.WriteLine("Scanning for virtual ABB controller...");
-                robotController = ConnectToVirtualController();
-                if (robotController == null)
-                {
-                    ExitWithError("ERROR: No virtual robot controller found!\nPlease ensure RobotStudio is running.");
-                    return;
-                }
-                Console.WriteLine($"[OK] Robot controller connected: {robotController.SystemName}");
+            // Start Worker Thread
+            Thread workerThread = new Thread(() => WorkerLoop(mappings));
+            workerThread.Name = "RoboCatyWorker";
+            workerThread.Start();
 
-                using (AdsClient client = new AdsClient())
+            // Input Loop (Main Thread)
+            while (!_quitRequested)
+            {
+                if (Console.KeyAvailable)
                 {
-                    try
+                    var keyInfo = Console.ReadKey(true);
+
+                    if (keyInfo.Key == ConsoleKey.Q)
                     {
-                        Console.WriteLine($"Connecting to TwinCAT {amsNetId}:{amsPort}...");
-                        client.Connect(amsNetId, amsPort);
-
-                        if (!client.IsConnected)
-                        {
-                            ExitWithError($"ERROR: Could not connect to TwinCAT.");
-                            return;
-                        }
-
-                        ISymbolLoader loader = SymbolLoaderFactory.Create(client, SymbolLoaderSettings.Default);
-                        Console.WriteLine("[OK] TwinCAT connected.");
-
-                        Console.WriteLine("\n================================================");
-                        Console.WriteLine(" Program running in background.");
-                        Console.WriteLine(" [V]   -> Toggle Live Dashboard (On/Off)");
-                        Console.WriteLine(" [Q]   -> Quit Program");
-                        Console.WriteLine("================================================");
-
-                        List<string> currentLogBuffer = new List<string>();
-
-                        while (keepRunning)
-                        {
-                            isProcessing = true;
-
-                            try
-                            {
-                                currentLogBuffer.Clear();
-
-                                ProcessMappings(mappings, loader, robotController, currentLogBuffer);
-
-                                if (showDashboard)
-                                {
-                                    Console.Clear();
-                                    Console.WriteLine($"--- RoboCaty MONITORING ACTIVE ({DateTime.Now:HH:mm:ss}) ---");
-                                    Console.WriteLine($"Cycle time: {cycleTimeMs}ms | Mappings: {mappings.Count}\n");
-                                    Console.WriteLine($"{"DIRECTION",-10} | {"ADS VARIABLE",-30} | {"VALUE",-10} | {"ROBOT SIGNAL",-30}");
-                                    Console.WriteLine(new string('-', 90));
-
-                                    foreach (string logLine in currentLogBuffer)
-                                    {
-                                        Console.WriteLine(logLine);
-                                    }
-                                }
-
-                                int slept = 0;
-                                while (slept < cycleTimeMs && keepRunning)
-                                {
-                                    Thread.Sleep(100);
-                                    slept += 100;
-                                }
-
-                                if (Console.KeyAvailable)
-                                {
-                                    var keyInfo = Console.ReadKey(true);
-                                    if (keyInfo.Key == ConsoleKey.Q || keyInfo.Key == ConsoleKey.Escape)
-                                    {
-                                        keepRunning = false;
-                                        Console.WriteLine("\nStopping program...");
-                                    }
-                                    else if (keyInfo.Key == ConsoleKey.V)
-                                    {
-                                        showDashboard = !showDashboard;
-                                        if (!showDashboard)
-                                        {
-                                            Console.Clear();
-                                            Console.WriteLine("Live dashboard deactivated.");
-                                            Console.WriteLine("Press [V] to enable, [Q] to quit.");
-                                        }
-                                    }
-                                }
-                            }
-                            catch (Exception ex)
-                            {
-                                Console.WriteLine("[ERR] Processing data exchange loop");
-                            }
-                            finally
-                            {
-                                isProcessing = false;
-                            }
-                        }
-
-                        isProcessing = false;
+                        break;
                     }
-                    catch (Exception ex)
+                    else if (keyInfo.Key == ConsoleKey.V)
                     {
-                        ExitWithError($"CRITICAL ERROR: {ex.Message}");
+                        showDashboard = !showDashboard;
+                        if (!showDashboard)
+                        {
+                            Console.Clear();
+                            PrintStatusScreen(mappings.Count);
+                        }
+                        Thread.Sleep(200);
+
+                        while (Console.KeyAvailable) Console.ReadKey(true);
                     }
                 }
+                Thread.Sleep(50);
+            }
 
-                if (robotController != null)
-                {
-                    CleanupResources();
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.ForegroundColor = ConsoleColor.Red;
-                Console.WriteLine($"\nCRITICAL ERROR: {ex.Message}");
-                Console.ResetColor();
-            }
-            finally
-            {
-                isProcessing = false;
-                CleanupResources();
-                Console.WriteLine("Done. Bye!");
-                Thread.Sleep(1000);
-            }
+            Console.WriteLine("\nStopping worker thread...");
+            SetQuitRequested();
+            _waitHandle.WaitOne();
+            Console.WriteLine("Main thread finished. Bye!");
+            CleanupRobot();
         }
 
-        // ---------------------------------------------------------
-        //  LOAD MAPPINGS
-        // ---------------------------------------------------------
-        static List<SignalMapping> LoadMappings(string filePath)
+        // --- Reprint the Home-Screen ---
+        static void PrintStatusScreen(int mappingCount)
         {
-            List<SignalMapping> list = new List<SignalMapping>();
-            string[] lines = File.ReadAllLines(filePath);
+            PrintHeader();
+            Console.WriteLine($"[OK] Variables loaded: {mappingCount}");
 
-            foreach (string line in lines)
-            {
-                string cleanLine = line.Trim();
-                if (string.IsNullOrEmpty(cleanLine)) continue;
+            if (robotController != null)
+                Console.WriteLine($"[OK] Robot connected:  {robotController.SystemName}");
+            else
+                Console.WriteLine($"[--] Robot connected:  Waiting...");
 
-                var match = Regex.Match(cleanLine, @"^(r|w)#\s*([^:]+):\s*([^\[]+)\[(\d+)\]");
+            Console.WriteLine($"[OK] TwinCAT Status:   Running (Cyclic)");
 
-                if (match.Success)
-                {
-                    SignalMapping map = new SignalMapping
-                    {
-                        Direction = match.Groups[1].Value,
-                        AdsPath = match.Groups[2].Value.Trim(),
-                        RobotSignal = match.Groups[3].Value.Trim(),
-                        Bits = int.Parse(match.Groups[4].Value)
-                    };
-                    list.Add(map);
-                }
-                else
-                {
-                    Console.WriteLine($"[WARNING] Invalid line ignored: {cleanLine}");
-                }
-            }
-            return list;
+            Console.WriteLine("\n---------------------------------------------------");
+            Console.WriteLine(" SYSTEM RUNNING (Background Mode).");
+            Console.WriteLine(" Press [V] -> Toggle Live Dashboard");
+            Console.WriteLine(" Press [Q] -> Quit Program");
+            Console.WriteLine("---------------------------------------------------");
         }
 
-        // ---------------------------------------------------------
-        //  PROCESS MAPPINGS
-        // ---------------------------------------------------------
-        static void ProcessMappings(List<SignalMapping> mappings, ISymbolLoader adsLoader, Controller robotCtrl, List<string> logBuffer)
+        // --- WORKER THREAD ---
+        private static void WorkerLoop(List<SignalMapping> mappings)
         {
-            foreach (var map in mappings)
+            using (AdsClient client = new AdsClient())
             {
                 try
                 {
-                    if (map.Direction == "r")
+                    client.Connect(amsNetId, amsPort);
+                    if (!client.IsConnected)
                     {
-                        TransferAdsToRobot(adsLoader, robotCtrl, map.AdsPath, map.RobotSignal, map.Bits, logBuffer);
+                        Console.WriteLine("ERROR: Could not connect to TwinCAT.");
+                        _waitHandle.Set();
+                        return;
                     }
-                    else if (map.Direction == "w")
+
+                    ISymbolLoader loader = SymbolLoaderFactory.Create(client, SymbolLoaderSettings.Default);
+                    List<string> logBuffer = new List<string>();
+
+                    bool _wasShowingDashboard = false;
+                    DateTime _lastDisplayUpdate = DateTime.MinValue;
+                    TimeSpan _displayInterval = TimeSpan.FromMilliseconds(500);
+
+                    bool stop = false;
+                    while (!stop)
                     {
-                        TransferRobotToAds(adsLoader, robotCtrl, map.AdsPath, map.RobotSignal, map.Bits, logBuffer);
+                        lock (_syncLock) { if (_quitRequested) stop = true; }
+
+                        if (!stop)
+                        {
+                            if (showDashboard)
+                            {
+                                // Only update display if enough time passed (500ms)
+                                if (DateTime.Now - _lastDisplayUpdate > _displayInterval)
+                                {
+                                    logBuffer.Clear();
+                                    ProcessMappings(mappings, loader, robotController, logBuffer);
+
+                                    Console.Clear();
+                                    Console.WriteLine($"--- RoboCaty LIVE DASHBOARD ({DateTime.Now:HH:mm:ss}) ---");
+                                    Console.WriteLine($"Data Cycle: {cycleTimeMs}ms | Display Update: 500ms");
+                                    Console.WriteLine($"{"DIR",-5} | {"ADS VARIABLE",-30} | {"VAL",-8} | {"ROBOT SIGNAL",-30}");
+                                    Console.WriteLine(new string('-', 80));
+
+                                    foreach (var log in logBuffer) Console.WriteLine(log);
+
+                                    _wasShowingDashboard = true;
+                                    _lastDisplayUpdate = DateTime.Now;
+                                }
+                                else
+                                {
+                                    ProcessMappings(mappings, loader, robotController, null);
+                                }
+                            }
+                            else
+                            {
+                                // Dashboard OFF: Silent Mode
+                                if (_wasShowingDashboard)
+                                {
+                                    _wasShowingDashboard = false;
+                                }
+
+                                ProcessMappings(mappings, loader, robotController, null);
+                            }
+
+                            Thread.Sleep(cycleTimeMs);
+                        }
                     }
                 }
                 catch (Exception ex)
                 {
-                    logBuffer.Add($"[ERR] {map.AdsPath}: {ex.Message}");
+                    Console.WriteLine($"CRITICAL WORKER ERROR: {ex.Message}");
+                }
+                finally
+                {
+                    _waitHandle.Set();
                 }
             }
         }
 
-        static void TransferAdsToRobot(ISymbolLoader adsLoader, Controller robotCtrl, string adsPath, string signalName, int bits, List<string> logs)
+        // --- Threading Helpers ---
+        private static void SetQuitRequested() 
+        { 
+            lock (_syncLock) 
+            { 
+                _quitRequested = true; 
+            } 
+        }
+
+        // --- EVENT: Process Exit ---
+        static void CurrentDomain_ProcessExit(object? sender, EventArgs e) 
+        { 
+            SetQuitRequested(); 
+            CleanupRobot(); 
+        }
+
+        private static void CleanupRobot()
         {
-            object val = ReadAdsValue(adsLoader, adsPath);
+            if (robotController != null)
+            {
+                try 
+                { 
+                    robotController.Logoff(); 
+                    robotController.Dispose(); 
+                }
+                catch { }
+                finally 
+                { 
+                    robotController = null; 
+                }
+            }
+        }
+
+        // --- DATA EXCHANGE LOGIC ---
+        static void ProcessMappings(List<SignalMapping> mappings, ISymbolLoader adsLoader, Controller? robotCtrl, List<string>? logBuffer)
+        {
+            if (robotCtrl == null) return;
+            foreach (var map in mappings)
+            {
+                try
+                {
+                    if (map.Direction == "r") TransferAdsToRobot(adsLoader, robotCtrl, map.AdsPath, map.RobotSignal, map.Bits, logBuffer);
+                    else if (map.Direction == "w") TransferRobotToAds(adsLoader, robotCtrl, map.AdsPath, map.RobotSignal, map.Bits, logBuffer);
+                }
+                catch (Exception ex)
+                {
+                    if (logBuffer != null) logBuffer.Add($"[ERR] {map.AdsPath}: {ex.Message}");
+                }
+            }
+        }
+
+        static void TransferAdsToRobot(ISymbolLoader l, Controller c, string a, string r, int b, List<string>? logs)
+        {
+            object? val = ReadAdsValue(l, a);
             if (val == null)
             {
-                logs.Add($"ADS->ROB   | {adsPath,-30} | {"ERR",-10} | {signalName} (ADS var missing)");
+                if (logs != null) logs.Add($"ADS->ROB | {a,-30} | {"ERR",-8} | {r} (Missing)");
                 return;
             }
 
-            // Request Mastership to write to Robot
-            using (Mastership.Request(robotCtrl))
+            using (Mastership.Request(c))
             {
-                Signal sig = robotCtrl.IOSystem.GetSignal(signalName);
+                Signal sig = c.IOSystem.GetSignal(r);
                 if (sig == null)
                 {
-                    logs.Add($"ADS->ROB   | {adsPath,-30} | {val,-10} | {signalName} (Signal missing)");
+                    if (logs != null) logs.Add($"ADS->ROB | {a,-30} | {val,-8} | {r} (Sig Missing)");
                     return;
                 }
 
                 try
                 {
-                    string displayVal = val.ToString();
+                    string dVal = "";
 
-                    if (bits == 1)
+                    if (b == 1)
                     {
-                        bool b = Convert.ToBoolean(val);
-                        if (sig is DigitalSignal di)
-                        {
-                            // Write only if changed to save performance (optional)
-                            if (di.Value != (b ? 1 : 0)) di.Value = b ? 1 : 0;
-                        }
-                        displayVal = b ? "TRUE" : "FALSE";
+                        bool v = Convert.ToBoolean(val);
+                        if (sig is DigitalSignal di && di.Value != (v ? 1 : 0)) di.Value = v ? 1 : 0;
+                        if (logs != null) dVal = v ? "TRUE" : "FALSE";
                     }
                     else
                     {
                         double d = Convert.ToDouble(val);
-                        if (sig is GroupSignal g) g.Value = (float)d;
-                        else if (sig is AnalogSignal a) a.Value = (float)d;
-                        displayVal = d.ToString("0.##");
+                        if (sig is GroupSignal g) g.Value = (float)d; else if (sig is AnalogSignal an) an.Value = (float)d;
+                        if (logs != null) dVal = d.ToString("0.##");
                     }
-                    logs.Add($"ADS->ROB   | {adsPath,-30} | {displayVal,-10} | {signalName}");
+
+                    if (logs != null) logs.Add($"ADS->ROB | {a,-30} | {dVal,-8} | {r}");
                 }
-                catch (Exception ex) { logs.Add($"[ERR WRITE] {signalName}: {ex.Message}"); }
+                catch (Exception x)
+                {
+                    if (logs != null) logs.Add($"[ERR] {r}: {x.Message}");
+                }
             }
         }
 
-        static void TransferRobotToAds(ISymbolLoader adsLoader, Controller robotCtrl, string adsPath, string signalName, int bits, List<string> logs)
+        static void TransferRobotToAds(ISymbolLoader l, Controller c, string a, string r, int b, List<string>? logs)
         {
-            Signal sig = robotCtrl.IOSystem.GetSignal(signalName);
+            Signal sig = c.IOSystem.GetSignal(r);
             if (sig == null)
             {
-                logs.Add($"ROB->ADS   | {adsPath,-30} | {"---",-10} | {signalName} (Signal missing)");
+                if (logs != null) logs.Add($"ROB->ADS | {a,-30} | {"---",-8} | {r} (Sig Missing)");
                 return;
             }
 
-            object writeVal = null;
-            string displayVal = "";
+            object? wVal = null;
+            string dVal = "";
 
-            if (bits == 1)
+            if (b == 1)
             {
-                writeVal = (sig.Value == 1);
-                displayVal = (sig.Value == 1) ? "TRUE" : "FALSE";
+                wVal = (sig.Value == 1);
+                if (logs != null) dVal = (sig.Value == 1) ? "TRUE" : "FALSE";
             }
             else
             {
                 double v = sig.Value;
-                displayVal = v.ToString("0.##");
-
-                // Convert to specific ADS types based on bits
-                if (bits == 8) writeVal = Convert.ToByte(v);
-                else if (bits == 16) writeVal = Convert.ToUInt16(v);
-                else if (bits == 32) writeVal = Convert.ToUInt32(v);
-                else writeVal = v;
+                if (logs != null) dVal = v.ToString("0.##");
+                if (b == 8) wVal = Convert.ToByte(v); else if (b == 16) wVal = Convert.ToUInt16(v); else if (b == 32) wVal = Convert.ToUInt32(v); else wVal = v;
             }
 
-            WriteAdsValue(adsLoader, adsPath, writeVal);
-            logs.Add($"ROB->ADS   | {adsPath,-30} | {displayVal,-10} | {signalName}");
+            WriteAdsValue(l, a, wVal);
+
+            if (logs != null) logs.Add($"ROB->ADS | {a,-30} | {dVal,-8} | {r}");
         }
 
-        // ---------------------------------------------------------
-        // HELPER METHODS
-        // ---------------------------------------------------------
-        static object ReadAdsValue(ISymbolLoader loader, string path)
+        static object? ReadAdsValue(ISymbolLoader l, string p) { try { ISymbol s = l.Symbols[p]; if (s is IValueSymbol v) return v.ReadValue(); } catch { } return null; }
+        static void WriteAdsValue(ISymbolLoader l, string p, object v) { try { ISymbol s = l.Symbols[p]; if (s is IValueSymbol vs) vs.WriteValue(v); } catch { } }
+
+        static List<SignalMapping> LoadMappings(string p)
         {
-            try
+            var l = new List<SignalMapping>();
+            foreach (var ln in File.ReadAllLines(p))
             {
-                ISymbol s = loader.Symbols[path];
-                if (s is IValueSymbol v) return v.ReadValue();
+                var m = Regex.Match(ln.Trim(), @"^(r|w)#\s*([^:]+):\s*([^\[]+)\[(\d+)\]");
+                if (m.Success) l.Add(new SignalMapping { Direction = m.Groups[1].Value, AdsPath = m.Groups[2].Value.Trim(), RobotSignal = m.Groups[3].Value.Trim(), Bits = int.Parse(m.Groups[4].Value) });
             }
-            catch { }
+            return l;
+        }
+
+        static Controller? ConnectToVirtualController()
+        {
+            var s = new NetworkScanner(); s.Scan();
+            foreach (ControllerInfo c in s.Controllers)
+            {
+                if (c.IsVirtual)
+                {
+                    try
+                    {
+#pragma warning disable CS0618
+                        var ctrl = ControllerFactory.CreateFrom(c);
+#pragma warning restore CS0618
+                        ctrl.Logon(UserInfo.DefaultUser); return ctrl;
+                    }
+                    catch { }
+                }
+            }
             return null;
         }
 
-        static void WriteAdsValue(ISymbolLoader loader, string path, object value)
+        static void PrintHeader()
         {
-            try
-            {
-                ISymbol s = loader.Symbols[path];
-                if (s is IValueSymbol v) v.WriteValue(value);
-            }
-            catch { }
+            Console.WriteLine("###############################################");
+            Console.WriteLine("#             RoboCaty v1.0.0                 #");
+            Console.WriteLine("#     TwinCAT <-> ABB Robot Interface         #");
+            Console.WriteLine("###############################################");
+            Console.WriteLine($"NetID:   {amsNetId}");
+            Console.WriteLine($"Port:    {amsPort}");
+            Console.WriteLine($"File:    {textFilePath}");
+            Console.WriteLine($"Cycle:   {cycleTimeMs} ms");
+            Console.WriteLine("-----------------------------------------------");
         }
 
         static bool ParseArguments(string[] args)
@@ -382,118 +401,19 @@ namespace AdsRobotInterface
             Console.WriteLine("-file\t\tPath to mapping file");
             Console.WriteLine("-time\t\tCycle time in ms (Default: 2000)");
             Console.WriteLine("-verbose\tEnable live dashboard immediately");
-            Console.WriteLine("\nExample: RoboCaty.exe -file \"config.txt\" -time 500");
+            Console.WriteLine("\nExample: RoboCaty.exe -file \"config.txt\" -time 10");
             Console.ReadKey();
         }
 
-        static void ShowConfiguration()
-        {
-            Console.WriteLine("--------------------------------");
-            Console.WriteLine($"  NetID    : {amsNetId}");
-            Console.WriteLine($"  Port     : {amsPort}");
-            Console.WriteLine($"  File     : {textFilePath}");
-            Console.WriteLine($"  Cycle    : {cycleTimeMs} ms");
-            Console.WriteLine($"  Verbose  : {showDashboard}");
-            Console.WriteLine("--------------------------------");
-        }
-
-        static void ExitWithError(string message)
-        {
-            Console.ForegroundColor = ConsoleColor.Red;
-            Console.WriteLine("\n" + message);
-            Console.ResetColor();
-            Console.WriteLine("Press any key to exit...");
-            Console.ReadKey();
-            Environment.Exit(-1);
-        }
-
-        static Controller ConnectToVirtualController()
-        {
-            NetworkScanner s = new NetworkScanner();
-            s.Scan();
-
-            foreach (ControllerInfo c in s.Controllers)
-            {
-                if (c.IsVirtual)
-                {
-                    try
-                    {
-                        Controller ctrl = ControllerFactory.CreateFrom(c);
-
-                        ctrl.Logon(UserInfo.DefaultUser);
-                        return ctrl;
-                    }
-                    catch { }
-                }
-            }
-            return null;
-        }
-
-        private static void CleanupResources()
-        {
-            if (robotController != null)
-            {
-                Console.WriteLine("\nCleaning up resources...");
-
-                Console.WriteLine("- Logging off Robot...");
-                try
-                {
-                    robotController.Logoff();
-                }
-                catch {}
-
-                Console.WriteLine("- Disposing Robot Controller...");
-                try
-                {
-                    robotController.Dispose();
-                }
-                catch {}
-
-                robotController = null;
-            }
-        }
-
-        private static bool Handler(CtrlType sig)
-        {
-            switch (sig)
-            {
-                case CtrlType.CTRL_C_EVENT:
-                case CtrlType.CTRL_LOGOFF_EVENT:
-                case CtrlType.CTRL_SHUTDOWN_EVENT:
-                case CtrlType.CTRL_CLOSE_EVENT: // catch click on x (close)
-
-                    Console.WriteLine("\n[Shutdown] End program and cleanup resources...");
-                    keepRunning = false;
-
-                    Console.Write("Wait until data exchange cycle ends...");
-                    int maxWait = 40; // 40 * 100ms =4 Seconds
-                    while (isProcessing && maxWait > 0)
-                    {
-                        Thread.Sleep(100);
-                        maxWait--;
-                        Console.Write(".");
-                    }
-                    Console.WriteLine(" waiting Done.");
-
-                    CleanupResources();
-                    Console.WriteLine("Program done. Bye!");
-
-                    Thread.Sleep(2000);
-                    return true;
-                default:
-                    return false;
-            }
-        }
+        static void ExitWithError(string m) { Console.ForegroundColor = ConsoleColor.Red; Console.WriteLine("\n" + m); Console.ResetColor(); Console.ReadLine(); Environment.Exit(-1); }
     }
 
-    // ---------------------------------------------------------
-    // Data Structure for parsed mappings
-    // ---------------------------------------------------------
+    // Data Structure for Signal Mapping
     class SignalMapping
     {
-        public string Direction { get; set; }
-        public string AdsPath { get; set; }
-        public string RobotSignal { get; set; }
+        public string Direction { get; set; } = null!;
+        public string AdsPath { get; set; } = null!;
+        public string RobotSignal { get; set; } = null!;
         public int Bits { get; set; }
     }
 }
